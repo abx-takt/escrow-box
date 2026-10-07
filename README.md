@@ -117,30 +117,33 @@ A typical deal between a vendor and a customer (in the box's SSH roles, `provide
    is sealed yet; the source stays encrypted.
 
 4. **Vendor deploys and provisions.** The customer provides the VM on the agreed platform and grants
-   the vendor access to it. The vendor deploys the `box.efi` it built onto that VM and confirms, from
-   the platform's attestation, that the VM is the agreed confidential / Shielded instance — so the
-   key it is about to seal cannot be read from RAM or the vTPM. It boots the image and runs
-   `provision`: the box checks the key opens the source, seals it to this VM's TPM and measured boot,
-   and returns the Clevis blob **H** to the customer. The vendor knows exactly which image it
-   deployed and sealed.
+   the vendor the access to deploy and provision it. The vendor deploys the `box.efi` it built onto
+   that VM. **Before it transmits the key**, the vendor must establish — by a provisioning procedure
+   agreed in advance — that the endpoint about to receive the key is *that image* running on a
+   qualified platform, and bind that evidence to the channel carrying the key; having written a file
+   to a disk, or checking the instance type, is not enough on its own (the customer controls the
+   platform and could point the channel elsewhere or boot a different image). Only then does the
+   vendor send the key; the box checks it opens the source, seals it to this VM's TPM and measured
+   boot, and returns the Clevis blob **H** to the customer.
 
-5. **Customer takes over and checks.** The customer revokes the vendor's access. Because it owns the
-   platform account, it reads the VM's boot disk and confirms the loaded EFI image hashes to the
-   value it recorded in step 3 — so the running box is the one it inspected, not a substitute — and
-   runs `pcrs` as a live cross-check (PCRs 9 and 11 measure only the image, so they match the agreed
-   `box.efi` whatever the platform; PCR 4 also folds in the firmware's boot events). Then `check` and
-   `verify` confirm H opens here and the source rebuilds the delivered artifact byte for byte, and
-   `status` shows the rule's current decision. A second `provision` is refused while H exists; from
-   now on the vendor has no access.
+5. **Customer takes over and checks.** The customer revokes the vendor's deploy and admin access and
+   applies the agreed network restrictions. Before relying on the escrow, the customer confirms — by
+   an agreed handover procedure, using evidence *independent of the image being checked* (or a
+   customer-controlled trusted reboot after revocation) — that the VM is actually running the agreed
+   image. Reading the boot-disk file's hash and the box's own `pcrs` output are useful but **not
+   sufficient alone**: the hash proves a file's bytes, not what is in RAM, and `pcrs` is the box's own
+   unsigned report. Then `check` and `verify` confirm H opens here and the source rebuilds the
+   delivered artifact byte for byte, and `status` shows the rule's current decision. A second
+   `provision` is refused while H exists.
 
 6. **Done.** The box sits on the customer's VM. The customer can re-run `check` / `verify` / `status`
    any time, and `unlock` yields the source the moment the rule's release event occurs.
 
-> This split needs no trusted third party and no "did the key reach the right endpoint" assumption:
-> the vendor deploys the image, so it knows what it sealed; the customer owns the platform and
-> recorded the image hash, so it confirms the running box is that one. The one external trust is the
-> platform's attestation that the VM is a genuine confidential / Shielded instance — a check the
-> vendor makes before sealing (see [Limitations](#limitations)).
+> Having the vendor deploy the image removes the *third-party escrow agent*, but it does **not** by
+> itself remove the trust in a sound provisioning/handover procedure: the vendor must bind a fresh
+> attestation of the running image to the channel that carries the key (step 4), and the customer
+> must confirm the running image by evidence independent of the box (step 5). The prototype does not
+> implement that binding; it is the production step named under [Limitations](#limitations).
 
 ## The release rule
 
@@ -318,12 +321,24 @@ own kernel with `ESCROW_BOX_KERNEL=/path/to/vmlinuz` if the host has none under 
 
 This is a prototype. Before relying on it in production:
 
-- **Platform attestation.** Before sealing, the vendor must confirm the VM is a genuine confidential
-  / Shielded instance on the agreed platform — otherwise the customer could read the key from RAM.
-  Because the vendor deploys the image itself (see the procedure above), this is a check the vendor
-  performs at deploy time, not an unsolved "did the key reach the right endpoint" problem; it is
-  strongest when it rests on the platform's hardware attestation (a vTPM quote / confidential-VM
-  report) rather than the cloud console.
+- **Trusted provisioning and handover (the key binding).** Two bindings the prototype does not yet
+  implement:
+  - *at provisioning (step 4):* before the key is transmitted, fresh evidence that the receiving
+    endpoint is the agreed image on a qualified platform, bound to the channel carrying the key.
+    Having the vendor deploy the image removes the third-party agent but does not supply this — the
+    customer controls the platform and could substitute the endpoint or the running image; deploying
+    a file to a disk and checking the instance type are not enough.
+  - *at handover (step 5):* the customer confirming the running image by evidence independent of the
+    box; a disk-file hash and the box's own `pcrs` are not sufficient (a malicious box can run one
+    image in RAM while another sits on disk and report expected measurements).
+  Both are strongest on the platform's hardware attestation (a vTPM quote / confidential-VM report),
+  bound to a fresh nonce and the key channel.
+- **Platform trust model and lifetime.** The key re-enters RAM on every `check` / `verify` /
+  `unlock`, so "sealed to the TPM" is not "never in memory"; the chosen platform must keep memory and
+  TPM state confidential across every such operation and across the allowed restart, recovery and
+  migration paths — not merely carry a confidential-VM label at first boot. Record the trust model
+  (whom you rely on) and these requirements per platform, and re-provision if a configuration change
+  cannot preserve them.
 - **Availability.** H lives and dies with that VM's vTPM. Deleting the VM or its vTPM loses the
   escrow. Provision more than one, or keep a contractual fallback, while the vendor exists.
 - **Reproducible image.** Make the image byte-reproducible so the customer can confirm it was built
