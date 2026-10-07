@@ -31,60 +31,69 @@ conditional, self-contained, auditable escrow box for whatever you put inside.
 
 ## The problem
 
-"Source escrow" is an old idea: a customer buying a binary wants the source released if the vendor
-disappears, so they can keep maintaining what they depend on. The usual answer is a third-party
-escrow agent. That has three weaknesses:
+Escrow — leaving a secret with a neutral party to be released on an agreed condition — is an old
+idea. Source code released if a vendor disappears, a payment released when goods are delivered, a
+credential released on a deadline: all the same shape, and all usually answered by a **third-party
+escrow agent**, which has three weaknesses:
 
-1. **The agent is a trusted party.** It holds a key; it can be pressured, hacked, or go out of
+1. **The agent is a trusted party.** It holds the secret; it can be pressured, hacked, or go out of
    business. Both sides have to trust it.
-2. **The customer cannot check the deposit.** A vendor can deposit an empty archive, or last year's
-   code. The customer only finds out when it's too late to matter.
-3. **Release is a human/legal process**, slow and disputable, exactly when the vendor is gone and
-   can no longer cooperate.
+2. **The recipient cannot check the deposit.** The depositor can lodge the wrong thing — an empty
+   archive, last year's code, an address it secretly kept the key to — and the recipient finds out
+   only when it is too late to matter.
+3. **Release is a human/legal process**, slow and disputable, exactly when the depositor may be gone
+   and can no longer cooperate.
 
-The escrow box removes the agent, lets the customer verify the deposit continuously, and makes
-release a mechanical consequence of an observable fact.
+The escrow box removes the agent, lets the recipient verify the deposit continuously — as far as the
+secret allows (source that must rebuild the delivered binary; a wallet key that must control a
+published address) — and makes release a mechanical consequence of an observable, signed fact. The
+two examples above, source code and a wallet key, are instances of this one mechanism.
 
 ## The idea
 
+The two parties are the **provider** (deposits the secret) and the **client** (receives it on the
+event) — the box's two SSH roles. (In the source example they are the vendor and the customer; in
+the wallet example, the setup and payout sides.)
+
 ```
-   vendor                          one image per deal                      customer
-  ────────                      ───────────────────────                   ──────────
+   provider                        one image per deal                      client
+  ──────────                    ───────────────────────                   ────────
   builds the image   ────────▶  UKI: kernel + whole system (initramfs)     runs it in a VM
-  (encrypted source,            + encrypted source + build environment      with a TPM, on a
-   build env, rule)             + release rule + two SSH keys               platform both agree
+  (encrypted secret,            + encrypted secret + what verify needs      with a TPM, on a
+   verify data, rule)           + release rule + two SSH keys               platform both agree
 
                                 measured boot  ──▶  PCRs in the TPM
 
-  provisions once    ────────▶  seals the decryption key to THIS TPM   ───▶ keeps the sealed
-  (sends the key)               and THIS measured image  (Clevis tpm2)      key "H"
+  provisions once    ────────▶  seals the secret's key to THIS TPM     ───▶ keeps the sealed
+  (sets up the key)             and THIS measured image  (Clevis tpm2)      blob "H"
 
                                 the box accepts only fixed commands, no shell:
-                                  check   — the sealed key opens here and opens the source
-                                  verify  — rebuild the binary from the source, compare byte-for-byte
+                                  check   — the sealed key opens here, against this deal
+                                  verify  — prove the deposit is the agreed one, without revealing it
                                   status  — what the release rule decides right now, with evidence
-                                  unlock  — give out the source IFF the release event has occurred
+                                  release — act on the secret IFF the event occurred
+                                            (hand out the source; sign the agreed payment)
 ```
 
 - The **image** is one bootable EFI binary (a [UKI](https://uapi-group.org/specifications/specs/unified_kernel_image/):
-  stub + kernel + an initramfs holding the entire system). The vendor builds one per deal. Inside
-  it: the encrypted source, the exact build environment, the release rule, and two SSH public keys
-  (vendor's and customer's).
-- The customer gets the image and may inspect **every byte of it except the encrypted source**.
-- **Measured boot** records a hash of the image into the TPM's PCRs. The vendor **provisions** the
-  box once: it seals the source's decryption key to those PCRs and that TPM with
-  [Clevis](https://github.com/latchset/clevis)' `tpm2` pin. The sealed blob **H** is kept by the
-  customer. After provisioning the vendor has no further access.
-- From then on the customer drives the box through its commands. Each one unseals inside the box
+  stub + kernel + an initramfs holding the entire system). The provider builds one per deal. Inside
+  it: the encrypted secret, whatever `verify` needs (e.g. the build environment, for source), the
+  release rule, and two SSH public keys (the provider's and the client's).
+- The client gets the image and may inspect **every byte of it except the encrypted secret**.
+- **Measured boot** records a hash of the image into the TPM's PCRs. The box is **provisioned** once:
+  the key that opens or uses the secret is sealed to those PCRs and that TPM with
+  [Clevis](https://github.com/latchset/clevis)' `tpm2` pin. The sealed blob **H** stays on the box.
+  After provisioning the provider has no further access.
+- From then on the client drives the box through its commands. Each one unseals inside the box
   (`clevis decrypt`) and does exactly one job. Nothing but hashes, decisions and — after release —
-  the source itself ever leaves the box.
+  the released result ever leaves the box.
 
 Because the key is sealed to the measured image:
 
 - change one byte of the image, boot a different kernel, add a kernel parameter, or move H to
   another machine — and **H does not open**;
-- so the customer cannot tamper the rule out of the box and still unseal, and cannot run the box
-  somewhere it could read around it.
+- so neither party can tamper the rule out of the box and still unseal, nor run the box somewhere it
+  could be read around.
 
 ## Verifying the deposit, before any release
 
@@ -351,24 +360,25 @@ This is a prototype. Before relying on it in production:
   cannot preserve them.
 - **Availability.** H lives and dies with that VM's vTPM. Deleting the VM or its vTPM loses the
   escrow. Provision more than one, or keep a contractual fallback, while the vendor exists.
-- **Reproducible image.** Make the image byte-reproducible so the customer can confirm it was built
+- **Reproducible image.** Make the image byte-reproducible so the client can confirm it was built
   from public inputs.
 - **State freshness.** The on-disk state is authentic but not fresh: disk rollback can remove a
   latch or restart a grace period, so a grace period is not a guaranteed wall-clock bound without a
   freshness anchor (e.g. a TPM NV counter).
-- **Secure Boot / UKI signing**, and binding the escrowed build to the delivered artifact in your
-  own pipeline.
+- **Secure Boot / UKI signing**, and binding the deposit to what was promised (the escrowed source
+  to the delivered binary, the escrowed key to the published address) in your own pipeline.
 
 None of these are hidden: name them in whatever agreement wraps the box.
 
 ## Why this shape
 
 - **No escrow agent** to trust, pressure, or outlive.
-- **The customer verifies by building**, continuously, not by trusting a deposit.
+- **The client verifies the deposit itself**, continuously — by rebuilding, by the published
+  address, by whatever the secret allows — not by trusting what was lodged.
 - **Release is mechanical** and happens exactly when an observable, signed fact says so — including
-  when the vendor is gone and can no longer cooperate.
-- **The vendor's know-how stays sealed** until the event; the customer only ever sees hashes and
-  decisions before then.
+  when the provider is gone and can no longer cooperate.
+- **The secret stays sealed** until the event; before then the client only ever sees hashes and
+  decisions.
 
 ## License
 
