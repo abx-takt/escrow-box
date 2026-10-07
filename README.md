@@ -97,38 +97,40 @@ Because the key is sealed to the measured image:
 
 ## The release rule
 
-The rule is **pluggable**: it is just code inside the box that returns *hold* / *release* /
-*no-decision* from public, signed evidence. The reference rule is a vendor-liveness ("dead man's
-switch") rule, and shows the shape a good rule has:
+The rule is **pluggable** and general: it is code inside the box that returns *hold* / *release* /
+*no-decision* from public, signed evidence of an agreed event. The box acts on the secret — hands
+out the source, signs the payment — only when the rule says *release*. You write the rule for your
+situation (a company-registry status, a registry title change, a fixed date, a court-order
+attestation, a multi-party signal), as long as it rests on evidence the box can fetch and
+authenticate and on time the box does not control. Swap `box/rule.py`; the box's commands do not
+depend on which rule is inside.
 
-The box **holds** while all of these are true, and **releases** otherwise:
+Whatever the event, a sound rule has the same careful edges:
 
-- the vendor's entry in a public company register is **not** terminal (dissolved, in liquidation,
-  administration, receivership, insolvency, struck off, …);
-- a **recent, validly signed heartbeat** is present in a public repository (the vendor publishes a
-  short signed statement on a schedule);
-
-with the careful edges a real rule needs:
-
-- a **grace period** before a deleted/hidden heartbeat repository counts as release (an
-  administrative mistake should not trigger escrow);
-- a **latch**: a heartbeat signed for the *future* (an attempt to pre-stage liveness) arms release
-  for good;
-- **time comes only from the TLS `Date` headers** of the evidence sources, which must agree within
-  a few minutes — never from the VM's own clock, which the operator controls;
+- **a grace period** before a missing or unreachable source counts as release — an administrative
+  mistake or a brief outage should not trigger it;
+- **a latch**: evidence that could be pre-staged (for example a signal dated in the future) arms
+  release for good once seen, so it cannot be used to extend a hold;
+- **time comes only from the TLS `Date` headers** of the evidence sources, which must agree within a
+  few minutes — never from the VM's own clock, which the operator controls;
 - **transport failure is never a decision**: if the sources can't be read, the box holds.
 
-Design your own rule for your situation — a fixed date, a court-order attestation, a multi-party
-signal — as long as it rests on evidence the box can fetch and authenticate, and on time it does not
-control.
+**The shipped reference rule** (`box/rule.py`) is a provider-liveness ("dead man's switch") rule,
+used by the source example: the box holds while the provider's entry in a public company register is
+**not** terminal (dissolved, liquidation, administration, receivership, insolvency, struck off, …)
+**and** a recent, validly signed heartbeat is present in a public repository, and releases
+otherwise — with the grace period, latch and time rules above. The wallet example points a rule of
+the same shape at the sale's settlement event instead (say a registry title change).
 
-### What the rule cannot do, and what the contract is for
+### What a rule cannot do, and what the agreement is for
 
-A rule evaluated from public signals cannot tell "the vendor is actively serving customers" from "a
-script is still publishing heartbeats on the vendor's behalf." That gap is closed by contract, not
-by code: the agreement obliges the vendor to hand over the key or the source on request in the
-cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
-the contract covers the rest.
+A rule knows only what it can fetch and authenticate, so it cannot separate facts that look
+identical on the wire — "the provider is actually serving customers" from "a script still publishes
+its heartbeat", or any off-chain obligation a public feed never reports. Where no authenticated,
+machine-checkable signal exists, that gap is closed outside the box: by a multi-party or contractual
+signal fed in as the rule's input, or by an agreement that obliges a party to act (hand over the key
+or the source, release the funds) in the cases the box cannot decide. The box is the automatic,
+un-cheatable path for the clear cases; the agreement covers the rest.
 
 ## What you must trust
 
