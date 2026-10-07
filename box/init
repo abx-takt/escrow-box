@@ -1,0 +1,83 @@
+#!/bin/bash
+# PID 1 of the escrow box. The whole system is this initramfs, measured as part of the UKI.
+# No getty, no shell for anyone: the only way in is SSH with forced commands (escrow-box).
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+chmod 755 /                      # the initramfs root comes up world-writable; sshd StrictModes rejects that
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sys /sys
+mount -t devtmpfs -o nosuid,noexec dev /dev
+exec </dev/console >/dev/console 2>&1
+ln -s /proc/self/fd /dev/fd; ln -s fd/0 /dev/stdin; ln -s fd/1 /dev/stdout; ln -s fd/2 /dev/stderr
+mkdir -p /dev/pts && mount -t devpts -o nosuid,noexec devpts /dev/pts
+mount -t tmpfs -o mode=755,nosuid,nodev run /run
+mount -t tmpfs -o mode=1777,nosuid,nodev tmp /tmp
+mount -t securityfs securityfs /sys/kernel/security 2>/dev/null
+die() { echo "escrow-box init: $*"; echo o > /proc/sysrq-trigger 2>/dev/null; sleep 5; exit 1; }
+
+# Nothing may read this machine's memory from inside: no ptrace, no core dumps, no kexec, no BPF
+# for anyone, no new kernel modules (everything needed is built in). lockdown=confidentiality on
+# the kernel command line closes /dev/mem, /proc/kcore, kprobes and hibernation.
+sysctl -q -w kernel.sysrq=0 kernel.kptr_restrict=2 kernel.dmesg_restrict=1 kernel.yama.ptrace_scope=3 \
+  kernel.unprivileged_bpf_disabled=1 kernel.kexec_load_disabled=1 fs.suid_dumpable=0 \
+  kernel.core_pattern='|/bin/false' kernel.perf_event_paranoid=3 || die "sysctl"
+grep -q '\[confidentiality\]' /sys/kernel/security/lockdown || die "kernel lockdown is not in confidentiality mode"
+[ -c /dev/tpmrm0 ] || die "no TPM"
+# The sealed identity is guarded by the PCR policy, not by a password. TPM dictionary-attack
+# protection would only lock the box out: every power-off without a TPM shutdown counts as a
+# failure, and a few forced stops put the TPM into lockout. recovery-time 0 disables it.
+export TPM2TOOLS_TCTI=device:/dev/tpmrm0
+tpm2_dictionarylockout -Q --setup-parameters --max-tries=4294967295 --recovery-time=0 --lockout-recovery-time=0 \
+  && tpm2_dictionarylockout -Q --clear-lockout || echo "escrow-box: warning: TPM dictionary-attack settings unchanged"
+
+ip link set lo up
+# The first non-loopback ethernet interface, by whatever name the platform gives it (eth0 locally,
+# ens4/enp0s* on clouds). The built-in driver may create the netdev a moment after PID 1 starts, so
+# wait briefly for it to appear.
+nic=""
+for _ in $(seq 40); do
+  nic=$(for i in /sys/class/net/*; do n=${i##*/}; [ "$n" = lo ] && continue; [ -e "$i/device" ] && { echo "$n"; break; }; done)
+  [ -n "$nic" ] && break
+  sleep 0.25
+done
+if [ -n "$nic" ]; then
+  ip link set "$nic" up
+  # One foreground lease so the address is set before we go on, then a background renewer.
+  busybox udhcpc -i "$nic" -s /usr/local/lib/escrow-box/udhcpc.script -n -q -t 10 -T 3 >/dev/console 2>&1 \
+    || echo "escrow-box: DHCP on $nic got no lease"
+  busybox udhcpc -i "$nic" -s /usr/local/lib/escrow-box/udhcpc.script -b -t 20 -T 3 >/dev/null 2>&1
+  echo "escrow-box: net $nic $(ip -4 -o addr show "$nic" 2>/dev/null | awk '{print $4}')"
+else
+  echo "escrow-box: no network interface found"
+fi
+
+# /data: the box's disk for H, the authenticated rule state and the SSH host key. It holds no
+# secret in clear. Found by its label; failing that, the first blank disk (no partition table, no
+# filesystem) is formatted and used. Works whatever the platform names the disks (vd*, sd*,
+# nvme*): the boot disk carries a GPT and so is never seen as blank. Without a spare disk /data is
+# in memory. Partitions, loop and ram devices are skipped.
+disks=$(for b in /sys/block/*; do n=${b##*/}; case "$n" in loop*|ram*|dm-*|sr*|fd*) continue;; esac; [ -e "$b/device" ] || continue; echo "/dev/$n"; done)
+data=""
+for d in $disks; do
+  [ "$(blkid -o value -s LABEL "$d" 2>/dev/null)" = escrow-data ] && { data=$d; break; }
+done
+if [ -z "$data" ]; then
+  for d in $disks; do
+    if [ -z "$(blkid -p "$d" 2>/dev/null)" ]; then mkfs.ext4 -q -L escrow-data "$d" && data=$d; break; fi
+  done
+fi
+# sync: the VM can lose power at any moment; H, the rule state and the host key must be on disk.
+if [ -n "$data" ]; then mount -o nosuid,nodev,noexec,sync "$data" /data || die "cannot mount $data"
+else mount -t tmpfs -o mode=700,nosuid,nodev,noexec data /data; fi
+chmod 700 /data
+sysctl -q -w kernel.modules_disabled=1
+
+mkdir -p /data/ssh /run/sshd
+if ! ssh-keygen -l -f /data/ssh/ssh_host_ed25519_key >/dev/null 2>&1; then
+  rm -f /data/ssh/ssh_host_ed25519_key /data/ssh/ssh_host_ed25519_key.pub
+  ssh-keygen -q -t ed25519 -N '' -f /data/ssh/ssh_host_ed25519_key && sync
+fi
+echo "escrow-box: SSH host key $(ssh-keygen -l -f /data/ssh/ssh_host_ed25519_key.pub)"
+echo "escrow-box: image $(cat /etc/escrow-box/image-id) order $(python3 -c 'import json;print(json.load(open("/etc/escrow-box/config.json"))["order"])')"
+/usr/sbin/sshd -f /etc/escrow-box/sshd_config -E /dev/console || die "sshd"
+echo "escrow-box: ready"
+exec /usr/bin/tini -s -- /usr/local/bin/escrow-box daemon

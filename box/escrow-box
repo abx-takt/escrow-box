@@ -1,0 +1,379 @@
+#!/usr/bin/python3
+"""Escrow box: the only commands of the sealed VM. They are reached over SSH as forced commands
+(one key, one role); nobody has a shell.
+
+  Provider's key: provision      stdin: the escrow key (an age secret key). One time: checks that
+                                 it opens the escrowed source, seals it to this VM's TPM and the
+                                 measured boot of this image, keeps H on /data, prints H.
+  Client's key:   check [-]      unseals H and confirms it opens the escrowed source (SHA-256 of
+                                 the manifest). "-": H from stdin, otherwise the copy on /data.
+                  verify [-]     as check, then rebuilds the source offline exactly as its
+                                 BUILD.txt says and compares the result with the delivered
+                                 artifact, byte for byte. Only hashes and PASS/DIFFERENT come out.
+                  status [-]     the release rule now, with its evidence.
+                  unlock [-]     if the release event has occurred: the source (tar) on stdout,
+                                 the decision on stderr. Otherwise refuses with the reason.
+                  sealed         H as kept on /data (useless without this VM's TPM and boot).
+                  pcrs           the PCR values of this boot (public).
+  Internal:       daemon         self-check every self_check_minutes (the reference rule arms its
+                                 latch when a heartbeat signed for the future is seen).
+
+The escrow key exists in clear only inside this VM's memory, only while a command runs.
+"""
+import base64
+import copy
+import fcntl
+import hashlib
+import hmac
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, '/usr/local/lib/escrow-box')
+import rule  # noqa: E402
+
+CFG = json.loads(Path(os.environ.get('ESCROW_BOX_CONFIG', '/etc/escrow-box/config.json')).read_text())
+SOURCE = Path('/opt/escrow-box/source.tar.age')
+DATA = Path(os.environ.get('ESCROW_BOX_DATA', '/data'))
+H_FILE, STATE, LOCK = DATA / 'H.jwe', DATA / 'state.json', DATA / '.lock'
+BUILDER = 902
+IDENT = re.compile(rb'AGE-SECRET-KEY-1[02-9ACDEFGHJKLMNPQRSTUVWXYZ]{58}')
+SEG = re.compile(rb'[A-Za-z0-9_-]+')
+JWE = re.compile(rb'[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')
+B64 = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def fail(msg, code=1):
+    print(f'FAIL: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def say(obj):
+    print(json.dumps(obj, indent=1, sort_keys=True), flush=True)
+
+
+# --- the sealed secret -------------------------------------------------------------------------
+
+def valid_envelope(h):
+    """True only if h is a clevis tpm2 JWE whose protected header is exactly the shape this order
+    seals to. Untrusted header fields must not be able to pick another backend, add command-line
+    options, choose an output path, or move key material: everything is checked before clevis sees
+    the bytes (R35-01). Only the sealed blobs vary; the policy fields must equal the order's."""
+    if not isinstance(h, (bytes, bytearray)) or not JWE.fullmatch(h):
+        return False
+    segs = h.split(b'.')
+    if len(segs) != 5 or not all(SEG.fullmatch(s) for s in segs[:1] + segs[2:]):
+        return False
+    try:
+        pad = segs[0] + b'=' * (-len(segs[0]) % 4)
+        header = json.loads(base64.urlsafe_b64decode(pad))
+    except (ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(header, dict) or set(header) - {'alg', 'enc', 'clevis'}:
+        return False
+    if header.get('alg') != 'dir' or not isinstance(header.get('enc'), str):
+        return False
+    clevis = header.get('clevis')
+    if not isinstance(clevis, dict) or set(clevis) - {'pin', 'tpm2'} or clevis.get('pin') != 'tpm2':
+        return False
+    t = clevis.get('tpm2')
+    if not isinstance(t, dict) or set(t) - {'hash', 'key', 'pcr_bank', 'pcr_ids', 'jwk_pub', 'jwk_priv'}:
+        return False
+    # The policy fields must be exactly the order's; no freedom for an attacker to shift them.
+    if t.get('pcr_bank') != CFG['pcr_bank'] or str(t.get('pcr_ids')) != str(CFG['pcr_ids']):
+        return False
+    if t.get('hash') not in ('sha1', 'sha256', 'sha384', 'sha512') or t.get('key') not in ('ecc', 'rsa'):
+        return False
+    # The sealed object halves are opaque, but must be plain base64url with no shell metacharacters.
+    for f in ('jwk_pub', 'jwk_priv'):
+        if not isinstance(t.get(f), str) or not B64.fullmatch(t[f]):
+            return False
+    return True
+
+
+def read_h(args):
+    if args[:1] == ['-']:
+        h = sys.stdin.buffer.read(1 << 20).strip()
+    elif H_FILE.exists():
+        h = H_FILE.read_bytes().strip()
+    else:
+        fail('no H: this box is not provisioned (or pass H on stdin with "-")')
+    if not valid_envelope(h):
+        fail('H is not a sealed key of this order (wrong shape, backend or policy)')
+    return h
+
+
+def unseal(h):
+    if not valid_envelope(h):
+        fail('H is not a sealed key of this order', 2)
+    r = subprocess.run(['clevis', 'decrypt'], input=h, capture_output=True)
+    ident = r.stdout.strip()
+    if r.returncode or not IDENT.fullmatch(ident):
+        why = [x for x in r.stderr.decode(errors='replace').splitlines() if x.strip()][-3:]
+        fail(f"H does not open here: another TPM, or this boot is not the measured boot it was sealed to ({' | '.join(why)[:300]})", 2)
+    return ident
+
+
+def open_source(ident):
+    """The plaintext source tar, checked against the manifest. The identity reaches age through
+    a pipe, never a file."""
+    rfd, wfd = os.pipe()
+    os.write(wfd, ident + b'\n')
+    os.close(wfd)
+    try:
+        r = subprocess.run(['age', '-d', '-i', f'/proc/self/fd/{rfd}', str(SOURCE)], capture_output=True, pass_fds=(rfd,))
+    finally:
+        os.close(rfd)
+    if r.returncode:
+        fail('the identity does not open the escrowed source', 3)
+    if hashlib.sha256(r.stdout).hexdigest() != CFG['source']['sha256']:
+        fail('the escrowed source does not match the manifest', 3)
+    return r.stdout
+
+
+def write_durably(path, data):
+    """Atomic replace that survives a power cut: data and directory entry reach the disk."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}-')
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    d = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(d)
+    finally:
+        os.close(d)
+
+
+class Store:
+    """The rule's state on /data, authenticated with a key derived from the escrow key, so
+    whoever controls the disk can delete or roll it back but cannot forge it."""
+
+    def __init__(self, ident):
+        self.key = hmac.new(ident, b'escrow-box state v1', hashlib.sha256).digest() if ident else None
+        self.rejected = False
+
+    def mac(self, body):
+        return hmac.new(self.key, json.dumps(body, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+
+    def load(self):
+        try:
+            doc = json.loads(STATE.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not self.key or not isinstance(doc, dict) or not isinstance(doc.get('state'), dict):
+            return {}
+        if not hmac.compare_digest(self.mac(doc['state']), str(doc.get('mac'))):
+            self.rejected = True
+            return {}
+        return doc['state']
+
+    def update(self, change):
+        """Read-modify-write under a file lock (the daemon and SSH sessions are separate
+        processes). An armed latch is monotonic: no change can remove it."""
+        if not self.key:
+            st = {}
+            change(st)
+            return st
+        with open(LOCK, 'a') as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            old = self.load()
+            st = copy.deepcopy(old)
+            change(st)
+            if old.get('latch'):
+                st['latch'] = old['latch']
+            if st != old or self.rejected:
+                write_durably(STATE, json.dumps({'state': st, 'mac': self.mac(st)}, sort_keys=True).encode())
+            return st
+
+
+def decide(ident):
+    store = Store(ident)
+    ev = rule.Rule(CFG['rule'], store).evaluate()
+    if store.rejected:
+        ev['state_on_disk'] = 'not authentic: ignored and replaced'
+    return ev
+
+
+# --- the rebuild -------------------------------------------------------------------------------
+
+def rebuild(src_tar):
+    """Rebuilds the source as its BUILD.txt says, as an unprivileged user without network, and
+    returns the SHA-256 of the produced artifact. The source tar holds one top directory with a
+    BUILD.txt whose lines are:
+
+        Command:            <the build command, run in that directory>
+        Environment:        (optional) one NAME=VALUE per line until a blank line
+        Artifact: <path>    the produced file, relative to that directory
+
+    The build log never leaves the box: build messages quote the source."""
+    work = Path(tempfile.mkdtemp(prefix='verify-', dir='/tmp'))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(src_tar)) as tf:
+            tf.extractall(work, filter='data')
+        (work / 'home').mkdir(exist_ok=True)
+        builds = list(work.glob('*/BUILD.txt'))
+        if len(builds) != 1:
+            fail('the source must have exactly one top directory with a BUILD.txt', 4)
+        bd = builds[0].parent
+        b = builds[0].read_text()
+        subprocess.run(['chown', '-R', f'{BUILDER}:{BUILDER}', str(work)], check=True)
+        lines = b.splitlines()
+        try:
+            cmd = next(lines[i + 1].strip() for i, x in enumerate(lines) if x.rstrip(':').strip() == 'Command')
+        except StopIteration:
+            fail('BUILD.txt has no Command:', 4)
+        art = re.search(r'^Artifact:\s*(\S+)', b, re.M)
+        if not art:
+            fail('BUILD.txt has no Artifact:', 4)
+        envs = []
+        if 'Environment:' in lines:
+            for x in lines[lines.index('Environment:') + 1:]:
+                if not x.strip():
+                    break
+                envs.append(x.strip())
+        env = ['env', '-i', 'PATH=/opt/build-env/bin:/usr/bin:/bin', f'HOME={work}/home',
+               'SOURCE_DATE_EPOCH=1700000000', 'LC_ALL=C', 'TZ=UTC', *envs]
+        r = subprocess.run(['unshare', '-n', '--', 'setpriv', f'--reuid={BUILDER}', f'--regid={BUILDER}', '--clear-groups', '--no-new-privs',
+                            *env, 'sh', '-c', cmd], cwd=bd, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode:
+            fail(f'the build failed (exit {r.returncode}); its log stays in the box', 4)
+        out = (bd / art.group(1)).resolve()
+        if work not in out.parents or not out.is_file():
+            fail(f"the build produced no artifact at {art.group(1)}", 4)
+        return hashlib.sha256(out.read_bytes()).hexdigest()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --- commands ----------------------------------------------------------------------------------
+
+def provision():
+    if H_FILE.exists():
+        fail('already provisioned: H exists on /data')
+    keys = [x.strip() for x in sys.stdin.buffer.read(4096).splitlines() if IDENT.fullmatch(x.strip())]
+    if len(keys) != 1:
+        fail('stdin must hold exactly one age secret key (an age-keygen file)')
+    ident = keys[0]
+    open_source(ident)
+    pin = json.dumps({'pcr_bank': CFG['pcr_bank'], 'pcr_ids': CFG['pcr_ids']})
+    r = subprocess.run(['clevis', 'encrypt', 'tpm2', pin], input=ident, capture_output=True)
+    h = r.stdout.strip()
+    if r.returncode or not valid_envelope(h):
+        fail(f"sealing to the TPM failed: {r.stderr.decode(errors='replace').strip()[-400:]}")
+    if unseal(h) != ident:
+        fail('the sealed H does not open back')
+    write_durably(H_FILE, h + b'\n')
+    sys.stdout.buffer.write(h + b'\n')
+
+
+def check(args):
+    open_source(unseal(read_h(args)))
+    say({'check': 'PASS', 'what': 'H opens on this machine and opens the escrowed source',
+         'source_sha256': CFG['source']['sha256'], 'order': CFG['order']})
+
+
+def verify(args):
+    got = rebuild(open_source(unseal(read_h(args))))
+    want = CFG['delivered']['sha256']
+    say({'verify': 'PASS' if got == want else 'DIFFERENT', 'delivered': CFG['delivered']['name'],
+         'delivered_sha256': want, 'rebuilt_sha256': got, 'order': CFG['order']})
+    if got != want:
+        sys.exit(5)
+
+
+def status(args):
+    ident = unseal(read_h(args)) if (args or H_FILE.exists()) else None
+    say(decide(ident))
+
+
+def unlock(args):
+    ident = unseal(read_h(args))
+    ev = decide(ident)
+    print(json.dumps(ev, sort_keys=True), file=sys.stderr, flush=True)
+    if not ev['release_event']:
+        fail(f"no release event: {ev['reason']}", 6)
+    sys.stdout.buffer.write(open_source(ident))
+
+
+def sealed():
+    if not H_FILE.exists():
+        fail('no H: this box is not provisioned')
+    h = H_FILE.read_bytes().strip()
+    if not valid_envelope(h):               # never hand out anything but a proper sealed key
+        fail('H on /data is not a sealed key of this order')
+    sys.stdout.buffer.write(h + b'\n')
+
+
+def pcrs():
+    r = subprocess.run(['tpm2_pcrread', f"{CFG['pcr_bank']}:0,1,4,5,7,9,11,12,13,14"], capture_output=True, text=True)
+    print(f"sealed to {CFG['pcr_bank']}:{CFG['pcr_ids']}\n{r.stdout}", end='')
+
+
+def self_check_once():
+    """One hourly self-check. Any error in it is logged and swallowed: a single bad check must
+    never stop the daemon (R35-02)."""
+    if not H_FILE.exists():
+        return
+    h = H_FILE.read_bytes().strip()
+    if not valid_envelope(h):
+        print('escrow-box: self-check: H on /data is not a sealed key of this order', flush=True)
+        return
+    r = subprocess.run(['clevis', 'decrypt'], input=h, capture_output=True)
+    ident = r.stdout.strip()
+    if r.returncode or not IDENT.fullmatch(ident):
+        print('escrow-box: self-check: H does not open on this boot', flush=True)
+        return
+    store = Store(ident)
+    ev = rule.Rule(CFG['rule'], store).self_check()
+    print(f"escrow-box: self-check {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}: {ev['decision']} ({ev['reason']})", flush=True)
+    if store.rejected:
+        print('escrow-box: self-check: the state on /data was not authentic: ignored and replaced', flush=True)
+    del ident
+
+
+def daemon():
+    every = CFG['rule'].get('self_check_minutes', 60) * 60
+    while True:
+        try:
+            self_check_once()
+        except Exception as e:                  # the loop outlives any single failed check
+            print(f'escrow-box: self-check error (continuing): {e}', flush=True)
+        time.sleep(every)
+
+
+CLIENT = {'check': check, 'verify': verify, 'status': status, 'unlock': unlock}
+
+
+def main():
+    role = sys.argv[1:2]
+    words = os.environ.get('SSH_ORIGINAL_COMMAND', '').split()
+    if role == ['provider']:
+        if words not in ([], ['provision']):
+            fail('the provider may only run: provision')
+        return provision()
+    if role == ['client']:
+        if words == ['pcrs']:
+            return pcrs()
+        if words == ['sealed']:
+            return sealed()
+        if not words or words[0] not in CLIENT or words[1:] not in ([], ['-']):
+            fail('commands: check [-] | verify [-] | status [-] | unlock [-] | sealed | pcrs')
+        return CLIENT[words[0]](words[1:])
+    if role == ['daemon'] and os.getpid() != 1 and os.getuid() == 0:
+        return daemon()
+    fail('usage: escrow-box provider|client (forced SSH commands) | daemon')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,28 @@
+# The only way into the escrow box: public keys with forced commands (authorized_keys), as root
+# because the commands use the TPM; root can do nothing but run them.
+Port 22
+HostKey /data/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /etc/escrow-box/authorized_keys
+AllowUsers root
+PermitRootLogin forced-commands-only
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+DisableForwarding yes
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitTunnel no
+PermitTTY no
+PermitUserRC no
+PermitUserEnvironment no
+PrintMotd no
+PrintLastLog no
+StrictModes yes
+MaxAuthTries 3
+MaxSessions 2
+ClientAliveInterval 60
+LogLevel INFO

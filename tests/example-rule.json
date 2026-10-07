@@ -1,0 +1,18 @@
+{
+  "heartbeat": {
+    "repository": "OWNER/heartbeat",
+    "path": "heartbeats",
+    "days": 90,
+    "max_future_hours": 1,
+    "missing_grace_days": 14,
+    "signer": "heartbeat@example.com",
+    "namespace": "heartbeat",
+    "allowed_signers": "heartbeat@example.com namespaces=\"heartbeat\" ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBKEY"
+  },
+  "companies_house": {
+    "page": "https://find-and-update.company-information.service.gov.uk/company/SC000000",
+    "name": "YOUR COMPANY NAME",
+    "terminal": ["Dissolved", "Liquidation", "Administration", "Receivership",
+                 "Insolvency proceedings", "Voluntary arrangement", "Converted / closed", "Removed"]
+  }
+}

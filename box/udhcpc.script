@@ -1,0 +1,18 @@
+#!/bin/sh
+# busybox udhcpc hook: address, default route and resolver of the box.
+case "$1" in
+  deconfig) ip addr flush dev "$interface"; ip link set "$interface" up ;;
+  bound|renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/${mask:-32}" dev "$interface"
+    if [ -n "$router" ]; then
+      r=${router%% *}
+      # On a cloud that hands out a /32 (GCE), the gateway is not on-link; add a host route to it
+      # first, then the default via it. On a normal subnet the host route is harmless.
+      ip route add "$r" dev "$interface" 2>/dev/null
+      ip route replace default via "$r" dev "$interface"
+    fi
+    : > /run/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /run/resolv.conf; done ;;
+esac
+exit 0

@@ -194,6 +194,37 @@ Cloud notes that bite in practice:
 - An unsigned UKI boots with **Secure Boot off**; that is fine for the key binding (PCR 4 covers the
   image). Sign the UKI with your own key if your platform requires Secure Boot on.
 
+## Repository layout
+
+| Path | What |
+|---|---|
+| `build.sh` | build one box image for a deal (`box.efi`, `box.json`, `order.key`) |
+| `run.sh` | local VM: QEMU + OVMF + swtpm per machine — `start` / `stop` / `ssh` / `destroy` |
+| `box/escrow-box` | the box's only commands (provision / check / verify / status / unlock / sealed / pcrs) |
+| `box/rule.py` | the example release rule (swap it for your own) |
+| `box/init`, `box/sshd_config`, `box/udhcpc.script` | PID 1 (measured-boot hardening), key-only forced-command sshd, DHCP hook |
+| `gcp/` | build a GCE image and a Shielded VM with a real vTPM — see `gcp/README.md` |
+| `tests/demo-source.sh` | a self-contained demo deal (a tiny C program + `BUILD.txt`) |
+| `tests/e2e.sh` | end-to-end in QEMU: provision, verify-by-rebuild, tamper, TPM binding |
+| `tests/test_box.py` | offline unit tests for the rule, the envelope check and the state MAC |
+| `tests/example-rule.json` | a template for the example rule's configuration |
+
+## Quick start (local, QEMU + swtpm)
+
+Needs a Linux host with KVM and: `qemu-system-x86_64`, `swtpm`, OVMF, `systemd-ukify`
+(`systemd-boot-efi`), `clevis`/`clevis-tpm2`, `tpm2-tools`, `age`, `sgdisk`, `mkfs.vfat`, `mtools`,
+plus passwordless `sudo` (the image is built in a chroot). Then:
+
+```bash
+tests/e2e.sh /tmp/escrow-demo          # builds a base image, a demo deal, boots it, runs the checks
+python3 tests/test_box.py              # offline unit tests (no VM, no network)
+```
+
+`tests/e2e.sh` boots the demo box, has the **provider** provision it, then — as the **client** —
+runs `check`, `verify` (rebuilds the demo binary byte for byte), proves a one-byte change to the
+image stops the unseal, and proves the sealed key does not open on a second machine's TPM. Pass your
+own kernel with `ESCROW_BOX_KERNEL=/path/to/vmlinuz` if the host has none under `/boot`.
+
 ## Limitations
 
 This is a prototype. Before relying on it in production:
