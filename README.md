@@ -1,23 +1,27 @@
 # Escrow box
 
-A way to escrow source code so that **neither the vendor nor the customer can cheat**:
+A way to put **any secret in escrow** so that **neither party can cheat**: the secret is used or
+handed over **only** when an agreed, checkable event has happened, nobody can take it early, nobody
+can stop it once the event occurs, and there is no trusted third-party escrow agent holding a key
+that either side could lean on.
 
-- the customer receives the source **only** when an agreed release event has happened (the vendor
-  is gone, a deadline passed, a signature lapsed — whatever rule you choose);
-- **before** that, the customer can prove to itself, as often as it likes, that the escrowed source
-  is exactly the source of the binary it was given — **without ever seeing the source**;
-- the vendor cannot quietly escrow the wrong thing, and cannot stop the release once the event has
-  happened;
-- there is no trusted third-party escrow agent holding a key that either side could lean on.
+The secret can be anything. Two examples, equally:
 
-The trick: the escrow is a small **sealed virtual machine image**. A decryption key is sealed, with
-a TPM, to the *measured boot of that exact image*. The image exposes only a few fixed commands and
-no shell. The key unseals **only** on an unmodified image, and the image hands out the source
-**only** when the release rule — evaluated inside the box against public, signed evidence — says the
-event has occurred.
+- **Source code** — the customer gets the source only if the vendor disappears, and *before* that
+  can prove to itself, as often as it likes, that the escrowed source really is the source of its
+  binary, **without ever seeing it**. ([walkthrough](#the-procedure-step-by-step))
+- **A crypto-wallet key in a sale** — the buyer funds a wallet; the seller gets the money only once
+  an agreed on-chain or registry event occurs; until then neither side can move the funds, and the
+  key is **never disclosed to anyone**. ([walkthrough](#example-a-wallet-key-in-a-sale))
+
+The trick is the same for both: the escrow is a small **sealed virtual machine image**. A key is
+sealed, with a TPM, to the *measured boot of that exact image*. The image exposes only a few fixed
+commands and no shell. The sealed key is usable **only** on an unmodified image, and the box acts on
+it — decrypting the source, or signing a payment — **only** when the release rule, evaluated inside
+the box against public, signed evidence, says the event has occurred.
 
 This is the classic "TPM / Clevis sealed secret" pattern (as used for disk unlock), turned into a
-conditional, self-contained, auditable source-escrow box.
+conditional, self-contained, auditable escrow box for whatever you put inside.
 
 > Status: **prototype**, adversarially reviewed. It runs today on a local QEMU + swtpm harness and
 > boots on a cloud Shielded VM. Several items are required before production use — see
@@ -180,38 +184,36 @@ by code: the agreement obliges the vendor to hand over the key or the source on 
 cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
 the contract covers the rest.
 
-## Beyond source code: escrowing any secret
+## Example: a wallet key in a sale
 
-Nothing in the box is specific to source. The same skeleton — **provision** (put a secret in, seal
-it to the measured image on a confidential VM), the client's checks, and **unlock** on an agreed
-event — escrows any secret whose release should be mechanical and un-cheatable.
-
-**Example: a wallet key in a sale.** A buyer pays into an escrow wallet; the seller should get
-control of the funds only once an agreed, checkable event occurs (say a change of title in a public
+The second example, a co-equal use of the same box. A buyer pays into an escrow wallet; the seller
+should get the money only once an agreed, checkable event occurs (say a change of title in a public
 registry). Mapped onto the box:
 
 - **provision** generates a fresh wallet key pair *inside the box*, prints the public address, and
   seals the private key to the measured image and the VM's TPM. The box does the sealing; no human
   ever handles the private key — not the buyer who runs provision (the confidential VM keeps it off
   the operator), not the seller. The key has no copy anywhere outside the sealed VM.
-- Both parties **verify the image** (hash the boot disk, cross-check `pcrs`) against the agreed,
-  open-source box *before any money moves*. This is what assures each side that the box neither
-  leaks the key to the other nor kept a copy — the whole deal rests on it.
+- Both parties **verify the image** against the agreed, open-source box *before any money moves* (the
+  same independent image check as in the source procedure). This is what assures each side that the
+  box neither leaks the key to the other nor kept a copy — the whole deal rests on it.
 - The **buyer funds** the printed address; the **seller confirms** the funds on the public chain.
-- On the agreed event the rule flips to release and **unlock** hands the private key to the seller —
-  or, in a safer variant, the box itself signs a sweep to the seller's address, so the key never
-  leaves the box at all.
+- **The key is never disclosed to anyone.** On the agreed event the box itself signs a transaction
+  that sends the balance to the **recipient address recorded at provision**, and broadcasts it. That
+  fixed destination is the only thing the box will ever pay to, so *whoever* manages to trigger a
+  transfer — buyer, seller, or anyone else — the money can only go to the agreed recipient. Releasing
+  a raw key is deliberately **not** an option.
 
-What each side cannot do mirrors the source case: the seller cannot take the funds before the event
-(the key is sealed; `unlock` refuses), and the buyer cannot claw them back (it cannot read the key
-either) — the worst either can do is destroy the VM, which freezes the funds for everyone including
-itself, so neither gains.
+What each side cannot do: the seller cannot take the funds before the event (the box won't sign
+until the rule releases), the buyer cannot claw them back (it never holds the key, and any transfer
+the box makes goes to the recipient, not back to the buyer) — the worst either can do is destroy the
+VM, which freezes the funds for everyone including itself, so neither gains.
 
 A one-time **test transfer** makes the whole chain checkable before the real money: `provision` can
-expose a single-use command that signs and broadcasts a tiny amount to a *pre-agreed* return
-address and then disables itself (a latch on the authenticated state). It proves the sealed key
-really controls the published address and that signing works, without putting the deal's funds at
-risk — the destination is fixed in advance and the command runs exactly once.
+expose a single-use command that signs and broadcasts a tiny amount to the *same pre-agreed
+recipient address* and then disables itself (a latch on the authenticated state). It proves the
+sealed key really controls the published address and that signing works, without any way to divert
+funds — the destination is fixed in advance and the command runs exactly once.
 
 Extra care this use needs, because the sealed secret now controls money: prefer a **confidential
 VM** (the key is kept even from the cloud, not only from the operator); **both** parties must verify
@@ -220,9 +222,9 @@ operator, add redundancy, or make a timeout-refund part of the rule); and the ru
 trustworthy as the authenticated, machine-checkable evidence of the event — where no signed feed
 exists, fall back to a multi-party or contractual signal as the rule's input.
 
-> This describes an application of the same `provision` / verify / `unlock` skeleton; the wallet
-> key generation, signing and test-transfer command are the box's payload for that flavour, not part
-> of the source-escrow reference here.
+> This describes an application of the same provision / verify / release skeleton; the wallet key
+> generation, the sign-to-recipient release and the test-transfer command are the box's payload for
+> that flavour, not part of the source-escrow reference implementation here.
 
 ## What you must trust
 
