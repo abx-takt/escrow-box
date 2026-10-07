@@ -9,10 +9,10 @@ The secret can be anything. Two examples, equally:
 
 - **Source code** — the customer gets the source only if the vendor disappears, and *before* that
   can prove to itself, as often as it likes, that the escrowed source really is the source of its
-  binary, **without ever seeing it**. ([walkthrough](#the-procedure-step-by-step))
+  binary, **without ever seeing it**. ([walkthrough](#worked-example-source-code))
 - **A crypto-wallet key in a sale** — the buyer funds a wallet; the seller gets the money only once
   an agreed on-chain or registry event occurs; until then neither side can move the funds, and the
-  key is **never disclosed to anyone**. ([walkthrough](#example-a-wallet-key-in-a-sale))
+  key is **never disclosed to anyone**. ([walkthrough](#worked-example-a-wallet-key-in-a-sale))
 
 The trick is the same for both: the escrow is a small **sealed virtual machine image**. A key is
 sealed, with a TPM, to the *measured boot of that exact image*. The image exposes only a few fixed
@@ -95,7 +95,88 @@ Because the key is sealed to the measured image:
 - so neither party can tamper the rule out of the box and still unseal, nor run the box somewhere it
   could be read around.
 
-## Verifying the deposit, before any release
+## The release rule
+
+The rule is **pluggable**: it is just code inside the box that returns *hold* / *release* /
+*no-decision* from public, signed evidence. The reference rule is a vendor-liveness ("dead man's
+switch") rule, and shows the shape a good rule has:
+
+The box **holds** while all of these are true, and **releases** otherwise:
+
+- the vendor's entry in a public company register is **not** terminal (dissolved, in liquidation,
+  administration, receivership, insolvency, struck off, …);
+- a **recent, validly signed heartbeat** is present in a public repository (the vendor publishes a
+  short signed statement on a schedule);
+
+with the careful edges a real rule needs:
+
+- a **grace period** before a deleted/hidden heartbeat repository counts as release (an
+  administrative mistake should not trigger escrow);
+- a **latch**: a heartbeat signed for the *future* (an attempt to pre-stage liveness) arms release
+  for good;
+- **time comes only from the TLS `Date` headers** of the evidence sources, which must agree within
+  a few minutes — never from the VM's own clock, which the operator controls;
+- **transport failure is never a decision**: if the sources can't be read, the box holds.
+
+Design your own rule for your situation — a fixed date, a court-order attestation, a multi-party
+signal — as long as it rests on evidence the box can fetch and authenticate, and on time it does not
+control.
+
+### What the rule cannot do, and what the contract is for
+
+A rule evaluated from public signals cannot tell "the vendor is actively serving customers" from "a
+script is still publishing heartbeats on the vendor's behalf." That gap is closed by contract, not
+by code: the agreement obliges the vendor to hand over the key or the source on request in the
+cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
+the contract covers the rest.
+
+## What you must trust
+
+The box binds the key to an *unmodified image*. It does **not**, by itself, stop whoever runs the VM
+from reading the key out of RAM or the vTPM state. That is a property of the **platform**:
+
+| Where you run it | Who can read the running key |
+|---|---|
+| Your own hardware / your own hypervisor | you can — **not suitable** for escrow against yourself |
+| A cloud VM with a vTPM (e.g. a Shielded VM) | nobody but the cloud — you trust the cloud |
+| A confidential VM whose vTPM lives inside the TEE | nobody but the CPU vendor — you trust the silicon |
+
+For escrow, the customer runs the box on a platform where **the customer cannot read the VM's memory
+or TPM** — a cloud Shielded VM, or a confidential VM. That is the one external trust the design
+requires, and you choose how strong it is.
+
+Two integrity properties hold regardless of platform:
+
+- **The sealed-key envelope is validated before it is ever unsealed.** The box checks that H is a
+  `tpm2` blob with exactly this deal's policy (bank, PCR set) and nothing else, so a crafted
+  envelope cannot steer the unseal to leak key material.
+- **The box's on-disk state is authenticated** (a MAC under a key derived from the sealed secret),
+  so whoever controls the disk can delete or roll it back, but cannot forge a release.
+
+## What is sealed to what
+
+Clevis `tpm2`, SHA-256 bank, bound to the PCRs that describe *the image*, not the platform:
+
+- **PCR 4** — the firmware's hash of every EFI binary it starts (here, the whole UKI, and any loader
+  placed before it).
+- **PCR 9** — the initramfs and kernel command line, measured by the kernel itself.
+- **PCR 11** — the UKI's sections, measured by the boot stub.
+- **PCR 12 / 13** — kernel parameters, credentials and system extensions injected from *outside* the
+  image; these must stay empty.
+
+Firmware/platform PCRs (secure-boot state, platform config, partition table) are **deliberately not
+bound**: a cloud can change them with a firmware or dbx update, which would make the key
+permanently unsealable with no tampering involved. Bind only what identifies your image.
+
+## Worked example: source code
+
+---
+
+> **Everything in this worked example is specific to source-code escrow.** The sections above —
+> the rule, what you must trust, what is sealed — are general; the two parts below show the box
+> used to escrow source that must rebuild a delivered binary.
+
+### Verifying the deposit, before any release
 
 Two commands let the customer trust the deposit without seeing it:
 
@@ -110,7 +191,7 @@ So "is the right source really in here, and does it really produce my binary?" i
 customer, as often as it wants, years before any release — and answered by *building*, not by
 trusting a checksum someone handed over.
 
-## The procedure, step by step
+### The procedure, step by step
 
 A typical deal between a vendor and a customer (in the box's SSH roles, `provider` and `client`):
 
@@ -166,44 +247,13 @@ A typical deal between a vendor and a customer (in the box's SSH roles, `provide
 > whoever controls the account (see [What you must trust](#what-you-must-trust) and
 > [Limitations](#limitations)).
 
-## The release rule
+## Worked example: a wallet key in a sale
 
-The rule is **pluggable**: it is just code inside the box that returns *hold* / *release* /
-*no-decision* from public, signed evidence. The reference rule is a vendor-liveness ("dead man's
-switch") rule, and shows the shape a good rule has:
+---
 
-The box **holds** while all of these are true, and **releases** otherwise:
+> **Everything in this worked example is specific to the wallet case**, a co-equal use of the same box.
 
-- the vendor's entry in a public company register is **not** terminal (dissolved, in liquidation,
-  administration, receivership, insolvency, struck off, …);
-- a **recent, validly signed heartbeat** is present in a public repository (the vendor publishes a
-  short signed statement on a schedule);
-
-with the careful edges a real rule needs:
-
-- a **grace period** before a deleted/hidden heartbeat repository counts as release (an
-  administrative mistake should not trigger escrow);
-- a **latch**: a heartbeat signed for the *future* (an attempt to pre-stage liveness) arms release
-  for good;
-- **time comes only from the TLS `Date` headers** of the evidence sources, which must agree within
-  a few minutes — never from the VM's own clock, which the operator controls;
-- **transport failure is never a decision**: if the sources can't be read, the box holds.
-
-Design your own rule for your situation — a fixed date, a court-order attestation, a multi-party
-signal — as long as it rests on evidence the box can fetch and authenticate, and on time it does not
-control.
-
-### What the rule cannot do, and what the contract is for
-
-A rule evaluated from public signals cannot tell "the vendor is actively serving customers" from "a
-script is still publishing heartbeats on the vendor's behalf." That gap is closed by contract, not
-by code: the agreement obliges the vendor to hand over the key or the source on request in the
-cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
-the contract covers the rest.
-
-## Example: a wallet key in a sale
-
-The second example, a co-equal use of the same box. A buyer pays into an escrow wallet; the seller
+A buyer pays into an escrow wallet; the seller
 should get the money only once an agreed, checkable event occurs (say a change of title in a public
 registry). Mapped onto the box:
 
@@ -245,44 +295,6 @@ exists, fall back to a multi-party or contractual signal as the rule's input.
 > This describes an application of the same provision / verify / release skeleton; the wallet key
 > generation, the sign-to-recipient release and the test-transfer command are the box's payload for
 > that flavour, not part of the source-escrow reference implementation here.
-
-## What you must trust
-
-The box binds the key to an *unmodified image*. It does **not**, by itself, stop whoever runs the VM
-from reading the key out of RAM or the vTPM state. That is a property of the **platform**:
-
-| Where you run it | Who can read the running key |
-|---|---|
-| Your own hardware / your own hypervisor | you can — **not suitable** for escrow against yourself |
-| A cloud VM with a vTPM (e.g. a Shielded VM) | nobody but the cloud — you trust the cloud |
-| A confidential VM whose vTPM lives inside the TEE | nobody but the CPU vendor — you trust the silicon |
-
-For escrow, the customer runs the box on a platform where **the customer cannot read the VM's memory
-or TPM** — a cloud Shielded VM, or a confidential VM. That is the one external trust the design
-requires, and you choose how strong it is.
-
-Two integrity properties hold regardless of platform:
-
-- **The sealed-key envelope is validated before it is ever unsealed.** The box checks that H is a
-  `tpm2` blob with exactly this deal's policy (bank, PCR set) and nothing else, so a crafted
-  envelope cannot steer the unseal to leak key material.
-- **The box's on-disk state is authenticated** (a MAC under a key derived from the sealed secret),
-  so whoever controls the disk can delete or roll it back, but cannot forge a release.
-
-## What is sealed to what
-
-Clevis `tpm2`, SHA-256 bank, bound to the PCRs that describe *the image*, not the platform:
-
-- **PCR 4** — the firmware's hash of every EFI binary it starts (here, the whole UKI, and any loader
-  placed before it).
-- **PCR 9** — the initramfs and kernel command line, measured by the kernel itself.
-- **PCR 11** — the UKI's sections, measured by the boot stub.
-- **PCR 12 / 13** — kernel parameters, credentials and system extensions injected from *outside* the
-  image; these must stay empty.
-
-Firmware/platform PCRs (secure-boot state, platform config, partition table) are **deliberately not
-bound**: a cloud can change them with a firmware or dbx update, which would make the key
-permanently unsealable with no tampering involved. Bind only what identifies your image.
 
 ## Building and running
 
@@ -343,7 +355,7 @@ own kernel with `ESCROW_BOX_KERNEL=/path/to/vmlinuz` if the host has none under 
 
 This is a prototype. Before relying on it in production:
 
-- **Trusted provisioning and handover (the key binding).** The [procedure above](#the-procedure-step-by-step)
+- **Trusted provisioning and handover (the key binding).** The [procedure above](#worked-example-source-code)
   (vendor provisions in its own account → transfers the account → customer takes exclusive control
   and re-verifies from a fresh boot) is what gives the two bindings a sound provisioning needs: no
   foreign endpoint in the provisioning path, and a customer-initiated boot after full lockout so no
