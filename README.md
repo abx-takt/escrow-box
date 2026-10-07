@@ -177,6 +177,50 @@ by code: the agreement obliges the vendor to hand over the key or the source on 
 cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
 the contract covers the rest.
 
+## Beyond source code: escrowing any secret
+
+Nothing in the box is specific to source. The same skeleton — **provision** (put a secret in, seal
+it to the measured image on a confidential VM), the client's checks, and **unlock** on an agreed
+event — escrows any secret whose release should be mechanical and un-cheatable.
+
+**Example: a wallet key in a sale.** A buyer pays into an escrow wallet; the seller should get
+control of the funds only once an agreed, checkable event occurs (say a change of title in a public
+registry). Mapped onto the box:
+
+- **provision** generates a fresh wallet key pair *inside the box*, prints the public address, and
+  seals the private key to the measured image and the VM's TPM. The box does the sealing; no human
+  ever handles the private key — not the buyer who runs provision (the confidential VM keeps it off
+  the operator), not the seller. The key has no copy anywhere outside the sealed VM.
+- Both parties **verify the image** (hash the boot disk, cross-check `pcrs`) against the agreed,
+  open-source box *before any money moves*. This is what assures each side that the box neither
+  leaks the key to the other nor kept a copy — the whole deal rests on it.
+- The **buyer funds** the printed address; the **seller confirms** the funds on the public chain.
+- On the agreed event the rule flips to release and **unlock** hands the private key to the seller —
+  or, in a safer variant, the box itself signs a sweep to the seller's address, so the key never
+  leaves the box at all.
+
+What each side cannot do mirrors the source case: the seller cannot take the funds before the event
+(the key is sealed; `unlock` refuses), and the buyer cannot claw them back (it cannot read the key
+either) — the worst either can do is destroy the VM, which freezes the funds for everyone including
+itself, so neither gains.
+
+A one-time **test transfer** makes the whole chain checkable before the real money: `provision` can
+expose a single-use command that signs and broadcasts a tiny amount to a *pre-agreed* return
+address and then disables itself (a latch on the authenticated state). It proves the sealed key
+really controls the published address and that signing works, without putting the deal's funds at
+risk — the destination is fixed in advance and the command runs exactly once.
+
+Extra care this use needs, because the sealed secret now controls money: prefer a **confidential
+VM** (the key is kept even from the cloud, not only from the operator); **both** parties must verify
+the image before funds move; availability is sharper (a frozen VM freezes real money — pick the
+operator, add redundancy, or make a timeout-refund part of the rule); and the rule is only as
+trustworthy as the authenticated, machine-checkable evidence of the event — where no signed feed
+exists, fall back to a multi-party or contractual signal as the rule's input.
+
+> This describes an application of the same `provision` / verify / `unlock` skeleton; the wallet
+> key generation, signing and test-transfer command are the box's payload for that flavour, not part
+> of the source-escrow reference here.
+
 ## What you must trust
 
 The box binds the key to an *unmodified image*. It does **not**, by itself, stop whoever runs the VM
