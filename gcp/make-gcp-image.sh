@@ -12,10 +12,11 @@
 # Needs gcloud authenticated and a project with the Compute and Storage APIs on (see gcp/README.md).
 set -euo pipefail
 export PATH=$PATH:/usr/sbin:/sbin:$HOME/google-cloud-sdk/bin
-project=""
+project=""; features=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --box) box=$2;; --bucket) bucket=$2;; --image) image=$2;; --project) project=$2;;
+    --features) features=$2;;    # extra guest-os-features, e.g. SEV_CAPABLE,GVNIC for a Confidential VM
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
   shift 2
@@ -42,7 +43,7 @@ tar --format=oldgnu -C "$work" -Sczf "$work/box-image.tar.gz" disk.raw
 gsutil cp "$work/box-image.tar.gz" "$bucket/$image.tar.gz"
 gcloud "${proj[@]}" compute images create "$image" \
   --source-uri "$bucket/$image.tar.gz" \
-  --guest-os-features=UEFI_COMPATIBLE \
+  --guest-os-features="UEFI_COMPATIBLE${features:+,$features}" \
   --family=escrow-box
 echo "image: $image (from $box, $(sha256sum "$box" | cut -c1-16)...)"
 echo "create a machine from it with: escrow-box/gcp/create-vm.sh --image $image ..."

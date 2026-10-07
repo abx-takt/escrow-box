@@ -71,6 +71,44 @@ GCE also hands the instance a **/32 address**, so the subnet gateway is not on-l
 hook adds a host route to the gateway first, then the default route via it. Without that the default
 route silently fails and the box is unreachable.
 
+## Confidential VM (encrypted memory)
+
+A Shielded VM keeps the key off the *operator* but not off the cloud. A **Confidential VM** (AMD SEV
+/ SEV-SNP, or Intel TDX) encrypts guest memory in hardware, so the key is kept even from the cloud —
+the "trust the CPU vendor" tier, which is what the wallet example needs. The box runs on one, with
+two adjustments, because GCP Confidential VMs **force gVNIC and attach persistent disks as NVMe**
+(both kernel modules the stock image lacks):
+
+1. Bake the matching `gve` and `nvme` drivers into the image. Get them from the distro's module
+   packages for the **exact kernel** your image uses (Ubuntu: `gve` is in `linux-modules-extra-<ver>`,
+   `nvme`/`nvme-core`/`nvme-auth` in `linux-modules-<ver>`), put the `.ko` files in a directory, and
+   build with `build.sh --modules DIR`. The box early-loads them (in sorted order, so
+   `nvme-auth` < `nvme-core` < `nvme`) before it disables module loading — the only drivers it ever
+   loads.
+2. Create the image with the extra guest-OS features and the VM as confidential:
+
+   ```
+   gcp/make-gcp-image.sh --box OUT/box.efi --bucket gs://YOUR_BUCKET --image escrow-cvm \
+       --features SEV_CAPABLE,GVNIC
+   gcp/create-vm.sh --image escrow-cvm --vm escrow-cvm --confidential
+   ```
+
+   `--confidential` uses SEV, gVNIC, an `n2d` machine and `--maintenance-policy=TERMINATE`.
+
+The box boots even though `nvme` isn't in the kernel at hand-off — its root is the initramfs loaded
+into RAM by firmware, so the kernel never reads the boot disk; `nvme` is needed only to find the
+`/data` disk (without it, `/data` falls back to RAM and the sealed key is lost on stop).
+
+Measured on a real GCP Confidential VM (n2d, SEV): guest serial reports *Memory Encryption Features
+active: AMD SEV*; provision, `check`, `verify` (byte-for-byte) and `status` all succeed; the sealed
+key survives a stop/start on the NVMe data disk; and PCRs 4, 9, 11, 12, 13 are identical across the
+restart.
+
+**Still open for the strongest tier:** an in-guest **SEV-SNP attestation report** (a hardware-rooted
+quote the provider could check at provisioning) needs the `sev-guest` / `configfs-tsm` drivers built
+in and an `SEV_SNP` machine; as built, the evidence that the VM is a genuine Confidential instance
+comes from the cloud control plane, not an in-guest hardware report.
+
 ## What this test answers
 
 - **PCR stability.** Compare the box's `pcrs` across a stop/start of the same VM. The sealed PCRs

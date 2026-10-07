@@ -29,6 +29,14 @@ export TPM2TOOLS_TCTI=device:/dev/tpmrm0
 tpm2_dictionarylockout -Q --setup-parameters --max-tries=4294967295 --recovery-time=0 --lockout-recovery-time=0 \
   && tpm2_dictionarylockout -Q --clear-lockout || echo "escrow-box: warning: TPM dictionary-attack settings unchanged"
 
+# Load the few network/disk drivers baked into the image (e.g. gve for gVNIC and nvme for the
+# data disk on a GCP Confidential VM). Loaded here, before module loading is disabled below;
+# nothing else can be loaded afterwards. Sorted order (nvme-auth < nvme-core < nvme).
+for m in /usr/local/lib/escrow-box/modules/*.ko; do
+  [ -e "$m" ] || continue
+  busybox insmod "$m" 2>/dev/null && echo "escrow-box: loaded module $(basename "$m")" || echo "escrow-box: module $(basename "$m") did not load"
+done
+
 ip link set lo up
 # The first non-loopback ethernet interface, by whatever name the platform gives it (eth0 locally,
 # ens4/enp0s* on clouds). The built-in driver may create the netdev a moment after PID 1 starts, so
