@@ -1,0 +1,230 @@
+# Escrow box
+
+A way to escrow source code so that **neither the vendor nor the customer can cheat**:
+
+- the customer receives the source **only** when an agreed release event has happened (the vendor
+  is gone, a deadline passed, a signature lapsed — whatever rule you choose);
+- **before** that, the customer can prove to itself, as often as it likes, that the escrowed source
+  is exactly the source of the binary it was given — **without ever seeing the source**;
+- the vendor cannot quietly escrow the wrong thing, and cannot stop the release once the event has
+  happened;
+- there is no trusted third-party escrow agent holding a key that either side could lean on.
+
+The trick: the escrow is a small **sealed virtual machine image**. A decryption key is sealed, with
+a TPM, to the *measured boot of that exact image*. The image exposes only a few fixed commands and
+no shell. The key unseals **only** on an unmodified image, and the image hands out the source
+**only** when the release rule — evaluated inside the box against public, signed evidence — says the
+event has occurred.
+
+This is the classic "TPM / Clevis sealed secret" pattern (as used for disk unlock), turned into a
+conditional, self-contained, auditable source-escrow box.
+
+> Status: **prototype**, adversarially reviewed. It runs today on a local QEMU + swtpm harness and
+> boots on a cloud Shielded VM. Several items are required before production use — see
+> [Limitations](#limitations). Nothing here promises a guarantee that has not been measured.
+
+---
+
+## The problem
+
+"Source escrow" is an old idea: a customer buying a binary wants the source released if the vendor
+disappears, so they can keep maintaining what they depend on. The usual answer is a third-party
+escrow agent. That has three weaknesses:
+
+1. **The agent is a trusted party.** It holds a key; it can be pressured, hacked, or go out of
+   business. Both sides have to trust it.
+2. **The customer cannot check the deposit.** A vendor can deposit an empty archive, or last year's
+   code. The customer only finds out when it's too late to matter.
+3. **Release is a human/legal process**, slow and disputable, exactly when the vendor is gone and
+   can no longer cooperate.
+
+The escrow box removes the agent, lets the customer verify the deposit continuously, and makes
+release a mechanical consequence of an observable fact.
+
+## The idea
+
+```
+   vendor                          one image per deal                      customer
+  ────────                      ───────────────────────                   ──────────
+  builds the image   ────────▶  UKI: kernel + whole system (initramfs)     runs it in a VM
+  (encrypted source,            + encrypted source + build environment      with a TPM, on a
+   build env, rule)             + release rule + two SSH keys               platform both agree
+
+                                measured boot  ──▶  PCRs in the TPM
+
+  provisions once    ────────▶  seals the decryption key to THIS TPM   ───▶ keeps the sealed
+  (sends the key)               and THIS measured image  (Clevis tpm2)      key "H"
+
+                                the box accepts only fixed commands, no shell:
+                                  check   — the sealed key opens here and opens the source
+                                  verify  — rebuild the binary from the source, compare byte-for-byte
+                                  status  — what the release rule decides right now, with evidence
+                                  unlock  — give out the source IFF the release event has occurred
+```
+
+- The **image** is one bootable EFI binary (a [UKI](https://uapi-group.org/specifications/specs/unified_kernel_image/):
+  stub + kernel + an initramfs holding the entire system). The vendor builds one per deal. Inside
+  it: the encrypted source, the exact build environment, the release rule, and two SSH public keys
+  (vendor's and customer's).
+- The customer gets the image and may inspect **every byte of it except the encrypted source**.
+- **Measured boot** records a hash of the image into the TPM's PCRs. The vendor **provisions** the
+  box once: it seals the source's decryption key to those PCRs and that TPM with
+  [Clevis](https://github.com/latchset/clevis)' `tpm2` pin. The sealed blob **H** is kept by the
+  customer. After provisioning the vendor has no further access.
+- From then on the customer drives the box through its commands. Each one unseals inside the box
+  (`clevis decrypt`) and does exactly one job. Nothing but hashes, decisions and — after release —
+  the source itself ever leaves the box.
+
+Because the key is sealed to the measured image:
+
+- change one byte of the image, boot a different kernel, add a kernel parameter, or move H to
+  another machine — and **H does not open**;
+- so the customer cannot tamper the rule out of the box and still unseal, and cannot run the box
+  somewhere it could read around it.
+
+## Verifying the deposit, before any release
+
+Two commands let the customer trust the deposit without seeing it:
+
+- **`check`** confirms the sealed key opens *here* and decrypts the escrowed archive to the SHA-256
+  recorded in the manifest.
+- **`verify`** goes further: it rebuilds the delivered binary from the escrowed source, offline,
+  exactly as the build instructions say, and compares the result with the delivered binary
+  **byte for byte**. It prints only the two hashes and PASS/DIFFERENT; the source and the build log
+  never leave the box.
+
+So "is the right source really in here, and does it really produce my binary?" is answered by the
+customer, as often as it wants, years before any release — and answered by *building*, not by
+trusting a checksum someone handed over.
+
+## The release rule
+
+The rule is **pluggable**: it is just code inside the box that returns *hold* / *release* /
+*no-decision* from public, signed evidence. The reference rule is a vendor-liveness ("dead man's
+switch") rule, and shows the shape a good rule has:
+
+The box **holds** while all of these are true, and **releases** otherwise:
+
+- the vendor's entry in a public company register is **not** terminal (dissolved, in liquidation,
+  administration, receivership, insolvency, struck off, …);
+- a **recent, validly signed heartbeat** is present in a public repository (the vendor publishes a
+  short signed statement on a schedule);
+
+with the careful edges a real rule needs:
+
+- a **grace period** before a deleted/hidden heartbeat repository counts as release (an
+  administrative mistake should not trigger escrow);
+- a **latch**: a heartbeat signed for the *future* (an attempt to pre-stage liveness) arms release
+  for good;
+- **time comes only from the TLS `Date` headers** of the evidence sources, which must agree within
+  a few minutes — never from the VM's own clock, which the operator controls;
+- **transport failure is never a decision**: if the sources can't be read, the box holds.
+
+Design your own rule for your situation — a fixed date, a court-order attestation, a multi-party
+signal — as long as it rests on evidence the box can fetch and authenticate, and on time it does not
+control.
+
+### What the rule cannot do, and what the contract is for
+
+A rule evaluated from public signals cannot tell "the vendor is actively serving customers" from "a
+script is still publishing heartbeats on the vendor's behalf." That gap is closed by contract, not
+by code: the agreement obliges the vendor to hand over the key or the source on request in the
+cases the box cannot distinguish. The box is the automatic, un-cheatable path for the clear cases;
+the contract covers the rest.
+
+## What you must trust
+
+The box binds the key to an *unmodified image*. It does **not**, by itself, stop whoever runs the VM
+from reading the key out of RAM or the vTPM state. That is a property of the **platform**:
+
+| Where you run it | Who can read the running key |
+|---|---|
+| Your own hardware / your own hypervisor | you can — **not suitable** for escrow against yourself |
+| A cloud VM with a vTPM (e.g. a Shielded VM) | nobody but the cloud — you trust the cloud |
+| A confidential VM whose vTPM lives inside the TEE | nobody but the CPU vendor — you trust the silicon |
+
+For escrow, the customer runs the box on a platform where **the customer cannot read the VM's memory
+or TPM** — a cloud Shielded VM, or a confidential VM. That is the one external trust the design
+requires, and you choose how strong it is.
+
+Two integrity properties hold regardless of platform:
+
+- **The sealed-key envelope is validated before it is ever unsealed.** The box checks that H is a
+  `tpm2` blob with exactly this deal's policy (bank, PCR set) and nothing else, so a crafted
+  envelope cannot steer the unseal to leak key material.
+- **The box's on-disk state is authenticated** (a MAC under a key derived from the sealed secret),
+  so whoever controls the disk can delete or roll it back, but cannot forge a release.
+
+## What is sealed to what
+
+Clevis `tpm2`, SHA-256 bank, bound to the PCRs that describe *the image*, not the platform:
+
+- **PCR 4** — the firmware's hash of every EFI binary it starts (here, the whole UKI, and any loader
+  placed before it).
+- **PCR 9** — the initramfs and kernel command line, measured by the kernel itself.
+- **PCR 11** — the UKI's sections, measured by the boot stub.
+- **PCR 12 / 13** — kernel parameters, credentials and system extensions injected from *outside* the
+  image; these must stay empty.
+
+Firmware/platform PCRs (secure-boot state, platform config, partition table) are **deliberately not
+bound**: a cloud can change them with a firmware or dbx update, which would make the key
+permanently unsealable with no tampering involved. Bind only what identifies your image.
+
+## Building and running
+
+The reference harness runs locally with QEMU + OVMF + swtpm — no cloud account needed — so you can
+develop and test the whole flow on one machine, then move the same image to a cloud Shielded VM or a
+confidential VM. In outline:
+
+1. **Build** one UKI per deal: kernel + an initramfs containing the hardened system, the encrypted
+   source, the build environment, the rule, and the two SSH keys. Boot it with measured boot; no
+   shell, SSH forced-commands only; the kernel locked down (no hibernation, kexec, ptrace, module
+   loading, `/dev/mem`).
+2. **Provision** once (vendor): send the decryption key over SSH; the box checks it opens the
+   source, seals it to the TPM + measured boot, and returns H.
+3. **Operate** (customer): `check`, `verify`, `status`, `unlock` over SSH, any time.
+
+Cloud notes that bite in practice:
+
+- Pick a machine type and image whose **disk and NIC drivers are in your kernel** (a module-less
+  initramfs sees only built-in drivers — e.g. prefer virtio over NVMe/gVNIC unless you build those
+  in).
+- Clouds that hand out a **/32 address** (so the gateway is off-link) need a host route to the
+  gateway before the default route.
+- An unsigned UKI boots with **Secure Boot off**; that is fine for the key binding (PCR 4 covers the
+  image). Sign the UKI with your own key if your platform requires Secure Boot on.
+
+## Limitations
+
+This is a prototype. Before relying on it in production:
+
+- **Trusted bootstrap.** Sealing binds the key to the TPM that already holds it; it does not, by
+  itself, prove to the vendor — *before the key is sent* — that the endpoint is the agreed image on
+  the agreed platform. Bind provisioning to a platform attestation of the image.
+- **Availability.** H lives and dies with that VM's vTPM. Deleting the VM or its vTPM loses the
+  escrow. Provision more than one, or keep a contractual fallback, while the vendor exists.
+- **Reproducible image.** Make the image byte-reproducible so the customer can confirm it was built
+  from public inputs.
+- **State freshness.** The on-disk state is authentic but not fresh: disk rollback can remove a
+  latch or restart a grace period, so a grace period is not a guaranteed wall-clock bound without a
+  freshness anchor (e.g. a TPM NV counter).
+- **Secure Boot / UKI signing**, and binding the escrowed build to the delivered artifact in your
+  own pipeline.
+
+None of these are hidden: name them in whatever agreement wraps the box.
+
+## Why this shape
+
+- **No escrow agent** to trust, pressure, or outlive.
+- **The customer verifies by building**, continuously, not by trusting a deposit.
+- **Release is mechanical** and happens exactly when an observable, signed fact says so — including
+  when the vendor is gone and can no longer cooperate.
+- **The vendor's know-how stays sealed** until the event; the customer only ever sees hashes and
+  decisions before then.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+The idea and this write-up come out of real source-escrow work; the design was refined through
+rounds of adversarial review. Contributions and independent implementations are welcome.
