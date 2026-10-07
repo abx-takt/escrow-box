@@ -120,34 +120,38 @@ A typical deal between a vendor and a customer (in the box's SSH roles, `provide
    the agreed ones, then records `sha256(box.efi)` — this is the exact image that must run. Nothing
    is sealed yet; the source stays encrypted.
 
-4. **Vendor deploys and provisions.** The customer provides the VM on the agreed platform and grants
-   the vendor the access to deploy and provision it. The vendor deploys the `box.efi` it built onto
-   that VM. **Before it transmits the key**, the vendor must establish — by a provisioning procedure
-   agreed in advance — that the endpoint about to receive the key is *that image* running on a
-   qualified platform, and bind that evidence to the channel carrying the key; having written a file
-   to a disk, or checking the instance type, is not enough on its own (the customer controls the
-   platform and could point the channel elsewhere or boot a different image). Only then does the
-   vendor send the key; the box checks it opens the source, seals it to this VM's TPM and measured
-   boot, and returns the Clevis blob **H** to the customer.
+4. **Vendor provisions in its own account.** The vendor creates the VM — a genuine confidential /
+   Shielded instance — in **its own account** at the agreed provider, deploys `box.efi`, boots it,
+   and provisions it: the box seals the escrow key to that running image's TPM and measured boot.
+   Because the whole provisioning happens inside the vendor's own account, with no other party in the
+   path, the vendor knows the key was sealed to the agreed image on the agreed platform — there is no
+   foreign endpoint to substitute and nothing to intercept. This is the account that will be handed
+   over; the customer pays for it.
 
-5. **Customer takes over and checks.** The customer revokes the vendor's deploy and admin access and
-   applies the agreed network restrictions. Before relying on the escrow, the customer confirms — by
-   an agreed handover procedure, using evidence *independent of the image being checked* (or a
-   customer-controlled trusted reboot after revocation) — that the VM is actually running the agreed
-   image. Reading the boot-disk file's hash and the box's own `pcrs` output are useful but **not
-   sufficient alone**: the hash proves a file's bytes, not what is in RAM, and `pcrs` is the box's own
-   unsigned report. Then `check` and `verify` confirm H opens here and the source rebuilds the
-   delivered artifact byte for byte, and `status` shows the rule's current decision. A second
-   `provision` is refused while H exists.
+5. **Handover, then the customer takes exclusive control and verifies.** The vendor transfers the
+   account — with the VM and its vTPM, carrying the sealed key **H** — to the customer. The customer
+   then takes **exclusive** control: it rotates *every* credential (password, 2FA, API keys, service
+   accounts, OS/SSH access, recovery contacts) and audits that no vendor principal or token remains.
+   Only once the vendor is fully locked out does the customer **cold-boot the VM itself** and verify:
+   the boot image hashes to the value recorded in step 3; `check` and `verify` pass (H opens on this
+   boot, and the source rebuilds the delivered artifact byte for byte); and `pcrs` matches the
+   expected measurements of that image. Because the customer initiated the boot with the vendor
+   locked out, the box answering is the one that booted from the verified image — the hash and `pcrs`
+   are conclusive here precisely because of the exclusive control and the fresh boot. Only then does
+   the customer sign the acceptance act.
 
-6. **Done.** The box sits on the customer's VM. The customer can re-run `check` / `verify` / `status`
-   any time, and `unlock` yields the source the moment the rule's release event occurs.
+6. **Done.** The box runs on the account the customer now controls. The customer can re-run
+   `check` / `verify` / `status` any time, and `unlock` yields the source (or, for a wallet, the box
+   signs the payment) the moment the rule's release event occurs.
 
-> Having the vendor deploy the image removes the *third-party escrow agent*, but it does **not** by
-> itself remove the trust in a sound provisioning/handover procedure: the vendor must bind a fresh
-> attestation of the running image to the channel that carries the key (step 4), and the customer
-> must confirm the running image by evidence independent of the box (step 5). The prototype does not
-> implement that binding; it is the production step named under [Limitations](#limitations).
+> This ordering is what makes the escrow sound without a third-party agent and without extra
+> attestation machinery: the vendor provisions in **its own account** (nothing it does not control is
+> in the provisioning path, so the key cannot be diverted — step 4), and the customer takes
+> **exclusive** control and re-verifies from a **fresh boot it initiated** (so no leftover process can
+> lie about the running image — step 5). It rests on one platform property: the VM is a genuine
+> confidential / Shielded instance, so the escrow key cannot be read from memory or the vTPM by
+> whoever controls the account — the vendor during provisioning, the customer afterwards (see
+> [What you must trust](#what-you-must-trust) and [Limitations](#limitations)).
 
 ## The release rule
 
@@ -323,18 +327,15 @@ own kernel with `ESCROW_BOX_KERNEL=/path/to/vmlinuz` if the host has none under 
 
 This is a prototype. Before relying on it in production:
 
-- **Trusted provisioning and handover (the key binding).** Two bindings the prototype does not yet
-  implement:
-  - *at provisioning (step 4):* before the key is transmitted, fresh evidence that the receiving
-    endpoint is the agreed image on a qualified platform, bound to the channel carrying the key.
-    Having the vendor deploy the image removes the third-party agent but does not supply this — the
-    customer controls the platform and could substitute the endpoint or the running image; deploying
-    a file to a disk and checking the instance type are not enough.
-  - *at handover (step 5):* the customer confirming the running image by evidence independent of the
-    box; a disk-file hash and the box's own `pcrs` are not sufficient (a malicious box can run one
-    image in RAM while another sits on disk and report expected measurements).
-  Both are strongest on the platform's hardware attestation (a vTPM quote / confidential-VM report),
-  bound to a fresh nonce and the key channel.
+- **Trusted provisioning and handover (the key binding).** The [procedure above](#the-procedure-step-by-step)
+  (vendor provisions in its own account → transfers the account → customer takes exclusive control
+  and re-verifies from a fresh boot) is what gives the two bindings a sound provisioning needs: no
+  foreign endpoint in the provisioning path, and a customer-initiated boot after full lockout so no
+  leftover process can misreport the running image. It rests on completeness, not on extra
+  attestation machinery: the customer must rotate *every* credential and access path and verify only
+  after a cold boot it initiated. The prototype does not automate or test this handover end to end,
+  and binding it additionally to the platform's hardware attestation (a vTPM quote bound to a fresh
+  nonce) would make the image check cryptographic rather than procedural.
 - **Platform trust model and lifetime.** The key re-enters RAM on every `check` / `verify` /
   `unlock`, so "sealed to the TPM" is not "never in memory"; the chosen platform must keep memory and
   TPM state confidential across every such operation and across the allowed restart, recovery and
