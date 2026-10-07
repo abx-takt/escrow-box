@@ -97,6 +97,46 @@ So "is the right source really in here, and does it really produce my binary?" i
 customer, as often as it wants, years before any release — and answered by *building*, not by
 trusting a checksum someone handed over.
 
+## The procedure, step by step
+
+A typical deal between a vendor and a customer (in the box's SSH roles, `provider` and `client`):
+
+1. **Agree.** Vendor and customer agree the release rule and how it is checked automatically
+   (`box/rule.py` + its config), and choose the platform the box will run on — one where the
+   customer cannot read the VM's memory or vTPM (a cloud Shielded VM, or a confidential VM; see
+   [What you must trust](#what-you-must-trust)).
+
+2. **Vendor prepares the box.** The vendor runs `build.sh` to produce one `box.efi` with the
+   encrypted source, the build environment and the agreed rule inside, and hands it to the customer.
+   The vendor keeps `order.key` (the escrow key) and gives it to no one. `box.json` lists the image
+   and source hashes and the PCRs the key will be sealed to.
+
+3. **Customer inspects and records the hash.** The customer reads the rule and configuration out of
+   the image (`box/rule.py`, `/etc/escrow-box/config.json` in the initramfs) and confirms they are
+   the agreed ones, then records `sha256(box.efi)` — this is the exact image that must run. Nothing
+   is sealed yet; the source stays encrypted.
+
+4. **Customer deploys, vendor provisions.** The customer prepares the VM on the chosen platform,
+   boots **the image it just hashed**, and gives the vendor access to that VM (its SSH port and its
+   configuration, so the vendor can confirm it is the agreed platform running the agreed image
+   before sending any key). The vendor runs `provision`: it sends the escrow key, the box checks the
+   key opens the source, seals it to this VM's TPM and measured boot, and returns the Clevis blob
+   **H** to the customer. Because the key is sealed to the image the customer deployed and hashed, the
+   vendor cannot substitute a different box without the sealed PCRs (readable with `pcrs`) ceasing to
+   match the recorded hash.
+
+5. **Customer takes over and checks the blob.** The customer revokes the vendor's access. It runs
+   `check` and `verify` — H opens on this VM, decrypts the source, and the source rebuilds the
+   delivered artifact byte for byte — and `status` to see the rule's current decision. From now on
+   the vendor has no access; a second `provision` is refused while H exists.
+
+6. **Done.** The box sits on the customer's VM. The customer can re-run `check` / `verify` / `status`
+   any time, and `unlock` yields the source the moment the rule's release event occurs.
+
+> Step 4 assumes the vendor can establish that the endpoint really is the agreed image on the agreed
+> platform before it sends the key. Binding that to a platform attestation is the production
+> hardening noted under [Limitations](#limitations); the prototype takes it on trust.
+
 ## The release rule
 
 The rule is **pluggable**: it is just code inside the box that returns *hold* / *release* /
