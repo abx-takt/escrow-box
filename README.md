@@ -144,14 +144,18 @@ A typical deal between a vendor and a customer (in the box's SSH roles, `provide
    `check` / `verify` / `status` any time, and `unlock` yields the source (or, for a wallet, the box
    signs the payment) the moment the rule's release event occurs.
 
-> This ordering is what makes the escrow sound without a third-party agent and without extra
-> attestation machinery: the vendor provisions in **its own account** (nothing it does not control is
-> in the provisioning path, so the key cannot be diverted — step 4), and the customer takes
-> **exclusive** control and re-verifies from a **fresh boot it initiated** (so no leftover process can
-> lie about the running image — step 5). It rests on one platform property: the VM is a genuine
+> This ordering is the approach a review accepted for removing the third-party agent and closing the
+> two provisioning/handover gaps — the vendor provisions with **exclusive control of the deployment
+> path** (nothing it does not control is in that path, so the key cannot be diverted — step 4), and
+> the customer takes **exclusive** control and re-verifies from a **fresh boot it initiated** (so no
+> leftover process can lie about the running image — step 5) — **provided** two conditions are met,
+> which the reference does not yet implement: the image and boot configuration are verified through
+> the platform's control plane *before* boot and the channel is bound to that verified VM/boot, and
+> the handover rotates the box's own SSH host key (or uses a trusted resource-bound channel) so a
+> retained key cannot let the vendor pass off another server. It also rests on the VM being a genuine
 > confidential / Shielded instance, so the escrow key cannot be read from memory or the vTPM by
-> whoever controls the account — the vendor during provisioning, the customer afterwards (see
-> [What you must trust](#what-you-must-trust) and [Limitations](#limitations)).
+> whoever controls the account (see [What you must trust](#what-you-must-trust) and
+> [Limitations](#limitations)).
 
 ## The release rule
 
@@ -195,9 +199,12 @@ should get the money only once an agreed, checkable event occurs (say a change o
 registry). Mapped onto the box:
 
 - **provision** generates a fresh wallet key pair *inside the box*, prints the public address, and
-  seals the private key to the measured image and the VM's TPM. The box does the sealing; no human
-  ever handles the private key — not the buyer who runs provision (the confidential VM keeps it off
-  the operator), not the seller. The key has no copy anywhere outside the sealed VM.
+  seals the private key to the measured image and the VM's TPM. The box does the sealing; the key
+  has no copy anywhere outside the sealed VM. Note this is a **different protocol** from the source
+  reference, whose `provision` receives the key from the vendor: a genuinely *vendor-blind* generated
+  key needs a confidential VM (so the vendor, who controls the account while provisioning, cannot
+  read the key as it is made) **and** a separate generation-and-provenance proof. The reference box
+  does not provide that; it is noted here as what the use would require.
 - Both parties **verify the image** against the agreed, open-source box *before any money moves* (the
   same independent image check as in the source procedure). This is what assures each side that the
   box neither leaks the key to the other nor kept a copy — the whole deal rests on it.
