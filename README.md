@@ -418,3 +418,9 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 
 The idea and this write-up come out of real source-escrow work; the design was refined through
 rounds of adversarial review. Contributions and independent implementations are welcome.
+
+## Updates
+
+Public notes about this prototype, measured CPU performance and integration limits are published
+in the [TAKT Telegram channel](https://t.me/taktcycles), in English with Russian summaries.
+TAKT is a commercial service of ABX DEVELOPMENT LLP; escrow-box remains an Apache-2.0 prototype.
