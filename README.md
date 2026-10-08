@@ -249,6 +249,24 @@ A typical deal between a vendor and a customer (in the box's SSH roles, `provide
 > whoever controls the account (see [What you must trust](#what-you-must-trust) and
 > [Limitations](#limitations)).
 
+### Keeping the box powered off
+
+After sealing and successful independent `check` / `verify`, the same VM can be shut down
+and kept powered off until a release-event check is needed. Keep the VM identity and its
+original TPM; shutting down does not mean deleting or replacing the VM.
+
+The VM's disk can be removed from the host to free space, provided a complete backup is kept
+and the agreed platform supports restoring it to the **same VM and TPM**. Preserve the verified
+image, encrypted deposit, sealed envelope H and authenticated box state in that backup. Restore
+the disk when the event needs checking, then boot the agreed image and re-run the checks.
+
+The small piece that must remain continuously preserved is the original **TPM state** — a few
+kilobytes of secret-bearing state, not a continuously running computer or a resident disk.
+Deleting/resetting that TPM or creating a replacement VM is not a disk restore. The box does
+not poll evidence while powered off; the configured rule's observation and grace requirements
+still apply when checks resume. This storage description does not qualify an untested cloud
+restore/handover path for production.
+
 ## Worked example: a wallet key in a sale
 
 ---
