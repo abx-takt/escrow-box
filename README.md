@@ -421,6 +421,6 @@ rounds of adversarial review. Contributions and independent implementations are 
 
 ## Updates
 
-Public notes about this prototype, measured CPU performance and integration limits are published
-in the [TAKT Telegram channel](https://t.me/taktcycles), in English with Russian summaries.
+CPU-performance examples and TAKT service updates from this repository's maintainers are
+published in the [TAKT Telegram channel](https://t.me/taktcycles). Posts are in English.
 TAKT is a commercial service of ABX DEVELOPMENT LLP; escrow-box remains an Apache-2.0 prototype.
